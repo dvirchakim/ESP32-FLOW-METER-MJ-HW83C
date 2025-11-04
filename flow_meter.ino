@@ -26,6 +26,20 @@
 #include <esp_task_wdt.h>
 #include <ArduinoJson.h>
 
+// Global variables for ISR
+volatile bool overflow_detected = false;
+volatile uint32_t overflow_count = 0;
+
+// PCNT ISR Handler
+void IRAM_ATTR pcnt_isr_handler(void* arg) {
+  overflow_detected = true;
+  overflow_count++;
+  if (overflow_count >= MAX_OVERFLOW_COUNT) {
+    pcnt_counter_clear(PCNT_UNIT_0);
+    overflow_count = 0;
+  }
+}
+
 // ------------ Wi-Fi ------------
 static const char* WIFI_SSID     = "NAME";
 static const char* WIFI_PASSWORD = "PASS";
@@ -123,15 +137,7 @@ void pcnt_init_unit() {
   
   // Register ISR service
   pcnt_isr_service_install(0);
-  pcnt_isr_handler_add(PCNT_UNIT, []() {
-    overflow_detected = true;
-    overflow_count++;
-    if (overflow_count >= MAX_OVERFLOW_COUNT) {
-      // Reset counter if too many overflows
-      pcnt_counter_clear(PCNT_UNIT);
-      overflow_count = 0;
-    }
-  }, NULL);
+  pcnt_isr_handler_add(PCNT_UNIT_0, pcnt_isr_handler, NULL);
   
   pcnt_counter_resume(PCNT_UNIT);
   
@@ -610,7 +616,12 @@ void setup() {
   setupWeb();
   
   // Configure watchdog
-  esp_task_wdt_init(10, true); // Enable panic so ESP32 restarts on watchdog timeout
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = 5000,  // 5 second timeout
+    .idle_core_mask = 0, // Disable WDT for idle tasks
+    .trigger_panic = true // Trigger panic on timeout
+  };
+  esp_task_wdt_init(&wdt_config);
   esp_task_wdt_add(NULL);      // Add current thread to WDT watch
   
   last_sample_ms = millis();
