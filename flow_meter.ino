@@ -474,6 +474,8 @@ const char INDEX_HTML[] PROGMEM = R"=====(
   var reconnectTimeout = null;
   var reconnectAttempts = 0;
   var maxReconnectAttempts = 5;
+  var lastMessageTime = 0;
+  var messageCount = 0;
   
   var connectWebSocket = function() {
     if (ws !== null) {
@@ -537,42 +539,82 @@ const char INDEX_HTML[] PROGMEM = R"=====(
   
   // Update UI with new data
   var updateUI = function(data) {
-    var now = new Date();
-    var timeStr = now.toLocaleTimeString();
+    try {
+      messageCount++;
+      lastMessageTime = Date.now();
+      
+      // Debug log every 10th message
+      if (messageCount % 10 === 0) {
+        console.log('Message #' + messageCount, data);
+      }
+      
+      // Convert integer values to float for display
+      var flowValue = data.flow_lpm_int / 1000.0;  // Assuming values are multiplied by 1000 on the ESP32
+      var hzValue = data.hz_int / 1000.0;
+      var totalValue = data.total_liters_int / 1000.0;
+      
+      // Update flow value display
+      var flowEl = document.getElementById('flow');
+      if (flowEl) {
+        flowEl.textContent = flowValue.toFixed(2);
+      }
+      
+      // Update chart if it exists
+      if (typeof flowChart !== 'undefined' && flowChart) {
+        if (flowChart.data.datasets[0].data.length >= maxDataPoints) {
+          flowChart.data.datasets[0].data.shift();
+          flowChart.data.labels.shift();
+        }
+        flowChart.data.datasets[0].data.push(flowValue);
+        flowChart.data.labels.push('');
+        
+        // Only update chart at appropriate intervals
+        var nowMs = Date.now();
+        if (!window.lastUpdate || (nowMs - window.lastUpdate) >= 500) {
+          flowChart.update('none');
+          window.lastUpdate = nowMs;
+        }
+      }
     
-    // Update chart
-    if (flowChart.data.datasets[0].data.length >= maxDataPoints) {
-      flowChart.data.datasets[0].data.shift();
-      flowChart.data.labels.shift();
-    }
-    flowChart.data.datasets[0].data.push(data.flow_lpm);
-    flowChart.data.labels.push('');
-    
-    // Only update chart at appropriate intervals
-    var nowMs = Date.now();
-    if (!window.lastUpdate || (nowMs - window.lastUpdate) >= 500) { // Throttle to 2fps
-      flowChart.update('none');
-      window.lastUpdate = nowMs;
-    }
-    
-    // Update gauge
-    setGauge(data.flow_lpm);
-    
-    // Update metrics
-    document.getElementById('hz').textContent = data.hz;
-    document.getElementById('tot').textContent = data.total_liters;
-    document.getElementById('ts').textContent = new Date(data.t_ms).toLocaleTimeString();
-    document.getElementById('model').textContent = data.model;
-    document.getElementById('ppl').textContent = data.ppl_int;
-    
-    // Update status
-    var statusEl = document.getElementById('statusText');
-    if (data.overflow) {
-      statusEl.textContent = 'Overflow Detected!';
-      statusEl.className = 'status-warn';
-    } else {
-      statusEl.textContent = 'Normal';
-      statusEl.className = '';
+      // Update gauge if it exists
+      if (typeof setGauge === 'function') {
+        setGauge(flowValue);
+      }
+      
+      // Update metrics
+      var hzEl = document.getElementById('hz');
+      var totEl = document.getElementById('tot');
+      var tsEl = document.getElementById('ts');
+      var modelEl = document.getElementById('model');
+      var pplEl = document.getElementById('ppl');
+      
+      if (hzEl) hzEl.textContent = hzValue.toFixed(1);
+      if (totEl) totEl.textContent = totalValue.toFixed(3);
+      if (tsEl) tsEl.textContent = new Date(data.t_ms).toLocaleTimeString();
+      if (modelEl) modelEl.textContent = data.model || 'N/A';
+      if (pplEl) pplEl.textContent = data.ppl_int || 'N/A';
+      
+      // Update status
+      var statusEl = document.getElementById('statusText');
+      if (statusEl) {
+        if (data.overflow) {
+          statusEl.textContent = 'Overflow!';
+          statusEl.className = 'status-warn';
+        } else {
+          statusEl.textContent = 'Normal';
+          statusEl.className = '';
+        }
+      }
+      
+      // Update connection status
+      var statusEl = document.getElementById('status');
+      if (statusEl && data.clients !== undefined) {
+        statusEl.textContent = 'Connected (' + data.clients + ')';
+        statusEl.style.color = 'var(--ok)';
+      }
+      
+    } catch (e) {
+      console.error('Error updating UI:', e);
     }
   };
 
@@ -686,8 +728,21 @@ const char INDEX_HTML[] PROGMEM = R"=====(
   // Initialize
   setGauge(0);
   
+  // Connection monitor
+  setInterval(function() {
+    // Show warning if no messages received in the last 3 seconds
+    if (lastMessageTime > 0 && (Date.now() - lastMessageTime > 3000)) {
+      var statusEl = document.getElementById('status');
+      if (statusEl) {
+        statusEl.textContent = 'No data (reconnecting...)';
+        statusEl.style.color = 'var(--warn)';
+      }
+    }
+  }, 1000);
+
   // Initialize WebSocket connection when page loads
   document.addEventListener('DOMContentLoaded', function() {
+    console.log('DOM fully loaded, initializing WebSocket...');
     console.log('DOM loaded, initializing...');
     
     // Add manual reconnect button
@@ -918,15 +973,53 @@ void sampleOnce() {
   g_hz_f = hz;
 
   // Broadcast to all WebSocket clients if there's a change in flow
+  static unsigned long lastBroadcast = 0;
   static float lastSentFlow = -1;
-  if (abs(g_flow_lpm_f - lastSentFlow) > 0.01f && webSocket.connectedClients() > 0) {
-    StaticJsonDocument<192> doc;
-    getMetricsJSON(doc);
+  
+  // Always broadcast at least every 500ms if there are clients
+  bool shouldBroadcast = (millis() - lastBroadcast >= 500 && webSocket.connectedClients() > 0);
+  
+  // Or broadcast immediately if flow changes significantly
+  if (abs(g_flow_lpm_f - lastSentFlow) > 0.01f) {
+    shouldBroadcast = true;
+  }
+  
+  if (shouldBroadcast && webSocket.connectedClients() > 0) {
+    StaticJsonDocument<256> doc;  // Increased size for additional fields
+    
+    // Add debug info
+    doc["flow_lpm"] = g_flow_lpm_f;
+    doc["hz"] = g_hz_f;
+    doc["total_liters"] = g_total_liters_f;
+    doc["t_ms"] = millis();
+    doc["overflow"] = overflow_detected;
+    doc["rssi"] = WiFi.RSSI();
+    doc["clients"] = webSocket.connectedClients();
+    doc["free_heap"] = ESP.getFreeHeap();
+    
     String json;
     if (serializeJson(doc, json) > 0) {
-      // Serial.println("Broadcasting: " + json); // Uncomment for debugging
-      webSocket.broadcastTXT(json);
-      lastSentFlow = g_flow_lpm_f;
+      if (webSocket.broadcastTXT(json)) {
+        lastSentFlow = g_flow_lpm_f;
+        lastBroadcast = millis();
+        
+        // Debug output every 2 seconds
+        static unsigned long lastDebug = 0;
+        if (millis() - lastDebug > 2000) {
+          lastDebug = millis();
+          Serial.print("WS Broadcast - Flow: ");
+          Serial.print(g_flow_lpm_f);
+          Serial.print(" L/min, Clients: ");
+          Serial.println(webSocket.connectedClients());
+          Serial.print("JSON: ");
+          serializeJsonPretty(doc, Serial);
+          Serial.println();
+        }
+      } else {
+        Serial.println("Error: WebSocket broadcast failed");
+      }
+    } else {
+      Serial.println("Error: Failed to serialize JSON");
     }
   }
 
