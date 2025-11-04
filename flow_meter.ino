@@ -63,8 +63,6 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
 
 // ------------ Error Handling ------------
 #define MAX_OVERFLOW_COUNT 10
-uint32_t overflow_count = 0;
-bool overflow_detected = false;
 
 // ------------ Flow input ------------
 static const gpio_num_t FLOW_GPIO = GPIO_NUM_34;
