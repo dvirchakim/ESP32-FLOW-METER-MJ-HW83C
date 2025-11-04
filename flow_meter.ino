@@ -4,7 +4,6 @@
   - Integer metrics (flow L/min, Hz, total liters)
   - Modern web gauge (live JSON polling)
   - Serial Plotter prints integers for easy reading
-  - Deep sleep with wake on button press (GPIO 0)
 
   Calibration:
     PULSES_PER_LITER = 1319  (your measured value)
@@ -20,7 +19,6 @@
 #include <WebServer.h>
 #include "driver/pcnt.h"
 #include <ESPmDNS.h>
-#include <esp_sleep.h>
 
 // ------------ Wi-Fi ------------
 static const char* WIFI_SSID     = "NAME";
@@ -31,10 +29,6 @@ static const char* MDNS_NAME     = "esp32flow";
 
 // ------------ Flow input ------------
 static const gpio_num_t FLOW_GPIO = GPIO_NUM_34;
-
-// ------------ Sleep button ------------
-static const gpio_num_t SLEEP_BUTTON_GPIO = GPIO_NUM_0;
-RTC_DATA_ATTR static int sleep_flag = 0;
 
 // We use the pulses-per-liter model with your calibration
 #define USE_FREQ_MODEL 0
@@ -350,13 +344,6 @@ void setup() {
   Serial.begin(115200);
   delay(250);
   Serial.println();
-
-  // Check if woken from deep sleep
-  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
-    sleep_flag = 0; // reset flag on wake
-    Serial.println("Woken from deep sleep");
-  }
   Serial.println(F("ESP32 Flow Meter + Modern Integer Gauge"));
 #if USE_FREQ_MODEL
   Serial.printf("Mode: Frequency model  K=%.3f Hz/LPM\n", HZ_PER_LPM);
@@ -366,7 +353,6 @@ void setup() {
   Serial.printf("Sample window: %lu ms\n", (unsigned long)SAMPLE_MS);
 
   pcnt_init_unit();
-  pinMode(SLEEP_BUTTON_GPIO, INPUT_PULLUP);
   startWiFi();
   setupWeb();
 
@@ -374,14 +360,6 @@ void setup() {
 }
 
 void loop() {
-  // Check for sleep button press
-  if (digitalRead(SLEEP_BUTTON_GPIO) == LOW && sleep_flag == 0) {
-    sleep_flag = 1;
-    Serial.println("Sleep button pressed, entering deep sleep...");
-    esp_deep_sleep_enable_ext0_wakeup(SLEEP_BUTTON_GPIO, 0); // wake on low
-    esp_deep_sleep_start();
-  }
-
   server.handleClient();
 
   unsigned long now = millis();
