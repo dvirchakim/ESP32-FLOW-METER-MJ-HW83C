@@ -4,9 +4,6 @@ A high-precision flow meter implementation using ESP32 with a modern web interfa
 
 <img width="568" height="819" alt="image" src="https://github.com/user-attachments/assets/4772011a-7878-4d64-9a66-98f36b412961" />
 
-
-![WhatsApp Image 2025-11-05 at 00 35 02](https://github.com/user-attachments/assets/1c9ff78b-a74d-43ba-99e6-dc11b1fb86e9)
-
 ## Features
 
 - 🚰 **Accurate Flow Measurement**
@@ -36,6 +33,10 @@ A high-precision flow meter implementation using ESP32 with a modern web interfa
   - Overflow detection and recovery
   - Watchdog timer
   - mDNS support (esp32flow.local)
+
+
+  ![WhatsApp Image 2025-11-05 at 00 35 02](https://github.com/user-attachments/assets/1c9ff78b-a74d-43ba-99e6-dc11b1fb86e9)
+
 
 ## Hardware Requirements
 
