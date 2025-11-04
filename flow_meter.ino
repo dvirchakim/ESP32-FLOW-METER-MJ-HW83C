@@ -77,10 +77,19 @@ const char* www_password = "flowmeter";
 // Moved to shared globals section
 
 // ------------ WebSocket ------------
-WebSocketsServer webSocket(81);  // Removed unnecessary initialization
+WebSocketsServer webSocket(81);  // Function prototypes
+void IRAM_ATTR pcnt_overflow_handler(void *arg);
+void pcnt_init_unit();
+void startWiFi();
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
-
-// ------------ Error Handling ------------
+bool is_authenticated();
+void getMetricsJSON(JsonDocument& doc);
+void handleMetrics();
+void handleRoot();
+void setupWeb();
+void enterLightSleep();
+float calculateAdaptiveAlpha(float flow_rate);
+void sampleOnce();
 
 // ------------ Flow input ------------
 static const gpio_num_t FLOW_GPIO = GPIO_NUM_34;
@@ -194,23 +203,41 @@ void startWiFi() {
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
   switch(type) {
     case WStype_DISCONNECTED:
-      Serial.printf("[%u] Disconnected!\n", num);
+      Serial.printf("[%u] Client disconnected\n", num);
       break;
+      
     case WStype_CONNECTED: {
       IPAddress ip = webSocket.remoteIP(num);
-      Serial.printf("[%u] Connected from %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
+      Serial.printf("[%u] New client connected from %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
+      
       // Send current state on connect
-      StaticJsonDocument<128> doc;
+      StaticJsonDocument<192> doc;
       getMetricsJSON(doc);
       String json;
-      serializeJson(doc, json);
-      webSocket.sendTXT(num, json);
+      if (serializeJson(doc, json) == 0) {
+        Serial.println("Error: Failed to serialize JSON for WebSocket");
+        return;
+      }
+      
+      if (!webSocket.sendTXT(num, json)) {
+        Serial.println("Error: Failed to send WebSocket message");
+      } else {
+        Serial.println("Sent initial data to client");
+      }
       break;
     }
+      
     case WStype_TEXT:
       // Handle incoming WebSocket messages if needed
+      // webSocket.sendTXT(num, payload, length); // Echo back for testing
       break;
+      
+    case WStype_ERROR:
+      Serial.printf("[%u] WebSocket error\n", num);
+      break;
+      
     default:
+      Serial.printf("[%u] Unhandled WebSocket event: %d\n", num, type);
       break;
   }
 }
@@ -226,13 +253,32 @@ bool is_authenticated() {
 
 // ------------ Metrics JSON Generator ------------
 void getMetricsJSON(JsonDocument& doc) {
+  // Use millis() for precise timing
+  static unsigned long lastUpdate = 0;
+  unsigned long now = millis();
+  
+  // Only update values if enough time has passed (throttle updates)
+  if (now - lastUpdate >= 500) {  // 2 updates per second max
+    lastUpdate = now;
+    
+    // Store values with millisecond precision
+    doc[F("flow_lpm")] = g_flow_lpm_f;
+    doc[F("hz")] = g_hz_f;
+    doc[F("total_liters")] = g_total_liters_f;
+    doc[F("t_ms")] = now;
+  }
+  
+  // Always include these values (they don't change often)
   doc[F("flow_lpm_int")] = (int)lroundf(g_flow_lpm_f);
   doc[F("hz_int")] = (int)lroundf(g_hz_f);
   doc[F("total_liters_int")] = (int)lroundf(g_total_liters_f);
-  doc[F("t_ms")] = millis();
   doc[F("model")] = USE_FREQ_MODEL ? F("Hz_per_LPM") : F("Pulses_per_Liter");
   doc[F("ppl_int")] = (int)lroundf(PULSES_PER_LITER * CAL_TRIM);
   doc[F("overflow")] = overflow_detected;
+  
+  // Add system info
+  doc[F("rssi")] = WiFi.RSSI();
+  doc[F("uptime")] = now / 1000;  // uptime in seconds
 }
 
 // ------------ Web UI ------------
@@ -255,13 +301,12 @@ const char INDEX_HTML[] PROGMEM = R"=====(
        min-height:100vh;display:grid;place-items:center;padding:24px}
   .wrap{width:100%;max-width:880px}
   .card{background:linear-gradient(180deg,#111826 0%,#0f1520 100%);border:1px solid var(--edge);
-        border-radius:18px;box-shadow:0 20px 40px rgba(0,0,0,.45);padding:22px}
-  .head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
-  .title{font-size:20px;font-weight:600;letter-spacing:.2px}
+        border-radius:16px;padding:24px;box-shadow:0 8px 16px rgba(0,0,0,0.2);max-width:800px;margin:0 auto;position:relative;overflow:hidden}
+  .title{color:var(--ink);font-size:20px;font-weight:600;margin-bottom:12px;text-transform:uppercase;letter-spacing:1px}
   .pill{border:1px solid #284059;border-radius:999px;padding:4px 10px;font-size:12px;color:var(--muted)}
-  .grid{display:grid;gap:18px;grid-template-columns:1fr; margin-top:14px}
+  .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin:20px 0;text-align:left}
   @media(min-width:780px){.grid{grid-template-columns:1.2fr 1fr}}
-  .panel{background:var(--card);border:1px solid var(--edge);border-radius:14px;padding:18px}
+  .metric{background:rgba(90,169,255,0.05);border-radius:8px;padding:12px;border:1px solid var(--edge);transition:all 0.2s ease}
   .gaugeWrap{display:grid;place-items:center;padding:10px}
   .big{display:flex;flex-direction:column;align-items:center;gap:2px;margin-top:6px}
   .big .value{font-size:56px;font-weight:800;letter-spacing:.5px}
@@ -269,11 +314,29 @@ const char INDEX_HTML[] PROGMEM = R"=====(
   .kv{display:flex;justify-content:space-between;color:var(--muted);font-size:14px;margin:8px 0}
   .kv b{color:var(--ink)}
   .status-warn{color:var(--warn) !important;}
-  .foot{margin-top:10px;color:var(--muted);font-size:12px;text-align:right}
-  .chart-container {margin-top:20px; width:100%; height:200px;}
+  .foot{text-align:center;margin-top:24px;padding-top:16px;border-top:1px solid var(--edge);color:var(--muted);font-size:12px;opacity:0.7}
+  .chart-container{height:180px;margin:16px 0;position:relative;background:rgba(0,0,0,0.1);border-radius:8px;padding:8px}
   .chart-panel {margin-top:20px;}
   /* Gauge */
-  .gauge{width:100%;max-width:420px;filter: drop-shadow(0 6px 18px rgba(90,169,255,.15));}
+  .time-interval-selector {
+    text-align: right;
+    margin-bottom: 16px;
+  }
+  .time-interval-selector label {
+    color: var(--muted);
+    margin-right: 8px;
+    font-size: 14px;
+  }
+  .time-interval-selector select {
+    background: var(--bg);
+    border: 1px solid var(--edge);
+    color: var(--ink);
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 14px;
+    outline: none;
+  }
+  .gauge-container{position:relative;width:100%;max-width:400px;margin:0 auto 24px;text-align:center}
   .track{stroke:#162233;stroke-width:18;fill:none;stroke-linecap:round}
   .bar{stroke:url(#grad);stroke-width:18;fill:none;stroke-linecap:round;transition:stroke-dashoffset .28s cubic-bezier(.2,.8,.2,1)}
   .tick{stroke:#24344a;stroke-width:2}
@@ -284,9 +347,20 @@ const char INDEX_HTML[] PROGMEM = R"=====(
 <body>
 <div class="wrap">
   <div class="card">
-    <div class="head">
+  <div class="time-interval-selector">
+    <label for="timeInterval">Time Range:</label>
+    <select id="timeInterval">
+      <option value="0.5s">30 Seconds</option>
+      <option value="1m" selected>1 Minute</option>
+      <option value="10m">10 Minutes</option>
+      <option value="30m">30 Minutes</option>
+    </select>
+  </div>
+  <div class="gauge-container">
       <div class="title">ESP32 Flow Monitor</div>
-      <div class="pill" id="status">Connecting…</div>
+          <div class="status-container" style="display: flex; align-items: center; gap: 8px;">
+            <div class="pill" id="status">Connecting…</div>
+          </div>
     </div>
 
     <div class="grid">
@@ -343,71 +417,156 @@ const char INDEX_HTML[] PROGMEM = R"=====(
 
 <script>
   // Configuration
-  const MAX_LPM = 10; // full-scale; change if your flow goes higher
-  const WS_RECONNECT_DELAY = 2000; // ms between WebSocket reconnection attempts
+  var MAX_LPM = 10; // full-scale; change if your flow goes higher
+  var WS_RECONNECT_DELAY = 2000; // ms between WebSocket reconnection attempts
+  
+  // Time intervals in milliseconds
+  var INTERVALS = {
+    '0.5s': 500,
+    '1m': 60000,
+    '10m': 600000,
+    '30m': 1800000
+  };
+  var currentInterval = '1m';
+  var maxDataPoints = 120; // Default for 1 minute at 0.5s intervals
   
   // Initialize UI
   document.getElementById('midLbl').textContent = Math.round(MAX_LPM/2);
   document.getElementById('maxLbl').textContent = MAX_LPM;
   
+  // Set up interval selector
+  var intervalSelect = document.getElementById('timeInterval');
+  
+  // Define updateChartInterval before using it
+  var updateChartInterval = function(interval) {
+    currentInterval = interval;
+    var intervalMs = INTERVALS[interval];
+    
+    // Calculate number of data points based on interval
+    if (interval === '0.5s') {
+      maxDataPoints = 120; // 1 minute at 0.5s intervals
+    } else {
+      // For longer intervals, show more data points
+      maxDataPoints = 60; // Show 60 points for all other intervals
+    }
+    
+    // Reset chart data
+    if (flowChart) {
+      flowChart.data.labels = Array(maxDataPoints).fill('');
+      flowChart.data.datasets[0].data = [];
+      flowChart.update('none');
+    }
+  };
+  
+  // Add event listener after function is defined
+  intervalSelect.addEventListener('change', function(e) {
+    updateChartInterval(e.target.value);
+  });
+  
+  // Initialize chart with default interval
+  updateChartInterval(currentInterval);
+  
+  // Make it globally available for debugging
+  window.updateChartInterval = updateChartInterval;
+  
   // WebSocket connection
-  let ws;
-  let reconnectTimeout;
+  var ws = null;
+  var reconnectTimeout = null;
+  var reconnectAttempts = 0;
+  var maxReconnectAttempts = 5;
   
   var connectWebSocket = function() {
+    if (ws !== null) {
+      try { ws.close(); } catch(e) { console.error('Error closing previous socket:', e); }
+    }
+    
     var protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
     var host = window.location.host;
-    ws = new WebSocket(protocol + host + ':81');
+    var wsUrl = protocol + host + ':81';
+    console.log('Connecting to WebSocket:', wsUrl);
     
-    ws.onopen = function() {
-      console.log('WebSocket connected');
-      document.getElementById('status').textContent = 'Connected';
-      document.getElementById('status').style.color = 'var(--ok)';
-      clearTimeout(reconnectTimeout);
-    };
-    
-    ws.onmessage = function(event) {
-      var data = JSON.parse(event.data);
-      updateUI(data);
-    };
-    
-    ws.onclose = function() {
-      console.log('WebSocket disconnected');
-      document.getElementById('status').textContent = 'Reconnecting...';
-      document.getElementById('status').style.color = 'var(--warn)';
+    try {
+      ws = new WebSocket(wsUrl);
       
-      // Try to reconnect after a delay
-      clearTimeout(reconnectTimeout);
-      reconnectTimeout = setTimeout(connectWebSocket, WS_RECONNECT_DELAY);
-    };
-    
-    ws.onerror = function(error) {
-      console.error('WebSocket error:', error);
-      ws.close(); // Will trigger onclose
-    };
+      ws.onopen = function() {
+        console.log('WebSocket connected');
+        document.getElementById('status').textContent = 'Connected';
+        document.getElementById('status').style.color = 'var(--ok)';
+        clearTimeout(reconnectTimeout);
+        reconnectAttempts = 0; // Reset reconnect attempts on successful connection
+      };
+      
+      ws.onmessage = function(event) {
+        try {
+          console.log('WebSocket message received:', event.data);
+          var data = JSON.parse(event.data);
+          updateUI(data);
+        } catch (e) {
+          console.error('Error processing WebSocket message:', e);
+        }
+      };
+      
+      ws.onclose = function(event) {
+        console.log('WebSocket disconnected. Code:', event.code, 'Reason:', event.reason);
+        document.getElementById('status').textContent = 'Disconnected';
+        document.getElementById('status').style.color = 'var(--warn)';
+        
+        // Try to reconnect after a delay with exponential backoff
+        reconnectAttempts++;
+        if (reconnectAttempts <= maxReconnectAttempts) {
+          var delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000); // Max 30s delay
+          console.log('Reconnecting in', delay, 'ms (attempt', reconnectAttempts, 'of', maxReconnectAttempts, ')');
+          clearTimeout(reconnectTimeout);
+          reconnectTimeout = setTimeout(connectWebSocket, delay);
+        } else {
+          console.error('Max reconnection attempts reached. Please refresh the page.');
+          document.getElementById('status').textContent = 'Connection failed - Please refresh';
+        }
+      };
+      
+      ws.onerror = function(error) {
+        console.error('WebSocket error:', error);
+        // The error event is followed by a close event, so we'll handle reconnection there
+      };
+    } catch (e) {
+      console.error('Error creating WebSocket:', e);
+      document.getElementById('status').textContent = 'Connection error';
+      document.getElementById('status').style.color = 'var(--warn)';
+    }
   };
   
   // Update UI with new data
   var updateUI = function(data) {
+    var now = new Date();
+    var timeStr = now.toLocaleTimeString();
+    
     // Update chart
-    flowChart.data.datasets[0].data.push(data.flow_lpm_int);
-    if (flowChart.data.datasets[0].data.length > maxDataPoints) {
+    if (flowChart.data.datasets[0].data.length >= maxDataPoints) {
       flowChart.data.datasets[0].data.shift();
+      flowChart.data.labels.shift();
     }
-    flowChart.update('none');
+    flowChart.data.datasets[0].data.push(data.flow_lpm);
+    flowChart.data.labels.push('');
+    
+    // Only update chart at appropriate intervals
+    var nowMs = Date.now();
+    if (!window.lastUpdate || (nowMs - window.lastUpdate) >= 500) { // Throttle to 2fps
+      flowChart.update('none');
+      window.lastUpdate = nowMs;
+    }
     
     // Update gauge
-    setGauge(data.flow_lpm_int);
+    setGauge(data.flow_lpm);
     
     // Update metrics
-    document.getElementById('hz').textContent = data.hz_int;
-    document.getElementById('tot').textContent = data.total_liters_int;
+    document.getElementById('hz').textContent = data.hz;
+    document.getElementById('tot').textContent = data.total_liters;
     document.getElementById('ts').textContent = new Date(data.t_ms).toLocaleTimeString();
     document.getElementById('model').textContent = data.model;
     document.getElementById('ppl').textContent = data.ppl_int;
     
     // Update status
-    const statusEl = document.getElementById('statusText');
+    var statusEl = document.getElementById('statusText');
     if (data.overflow) {
       statusEl.textContent = 'Overflow Detected!';
       statusEl.className = 'status-warn';
@@ -415,26 +574,26 @@ const char INDEX_HTML[] PROGMEM = R"=====(
       statusEl.textContent = 'Normal';
       statusEl.className = '';
     }
-  }
+  };
 
   // Create gauge ticks
-  const ticks = document.getElementById('ticks');
-  for (let i = 0; i <= 20; i++) {
-    const a = Math.PI - (Math.PI * i / 20);
-    const r1 = 110, r2 = (i % 5 === 0) ? 96 : 102;
-    const x1 = Math.cos(a)*r1, y1 = Math.sin(a)*r1;
-    const x2 = Math.cos(a)*r2, y2 = Math.sin(a)*r2;
-    const line = document.createElementNS("http://www.w3.org/2000/svg","line");
+  var ticks = document.getElementById('ticks');
+  for (var i = 0; i <= 20; i++) {
+    var a = Math.PI - (Math.PI * i / 20);
+    var r1 = 110, r2 = (i % 5 === 0) ? 96 : 102;
+    var x1 = Math.cos(a)*r1, y1 = Math.sin(a)*r1;
+    var x2 = Math.cos(a)*r2, y2 = Math.sin(a)*r2;
+    var line = document.createElementNS("http://www.w3.org/2000/svg","line");
     line.setAttribute("x1",x1); line.setAttribute("y1",y1);
     line.setAttribute("x2",x2); line.setAttribute("y2",y2);
     line.setAttribute("class","tick");
     ticks.appendChild(line);
   }
 
+
   // Chart setup
-  const maxDataPoints = 60; // 60 seconds of data at 1s intervals
-  const flowChartCtx = document.getElementById('flowChart').getContext('2d');
-  const flowChart = new Chart(flowChartCtx, {
+  var flowChartCtx = document.getElementById('flowChart').getContext('2d');
+  var flowChart = new Chart(flowChartCtx, {
     type: 'line',
     data: {
       labels: Array(maxDataPoints).fill(''),
@@ -444,6 +603,8 @@ const char INDEX_HTML[] PROGMEM = R"=====(
         borderColor: '#5aa9ff',
         backgroundColor: 'rgba(90, 169, 255, 0.1)',
         borderWidth: 2,
+        tension: 0.1,
+        pointRadius: 0,
         fill: true,
         tension: 0.3
       }]
@@ -487,26 +648,26 @@ const char INDEX_HTML[] PROGMEM = R"=====(
   });
 
   // Initialize chart with zeros
-  for (let i = 0; i < maxDataPoints; i++) {
+  for (var i = 0; i < maxDataPoints; i++) {
     flowChart.data.datasets[0].data.push(0);
   }
   flowChart.update();
 
   // Gauge setup
-  const arcLen = 346;
-  const bar = document.getElementById('bar');
-  const flowEl = document.getElementById('flow');
-  const stEl = document.getElementById('status');
+  var arcLen = 346;
+  var bar = document.getElementById('bar');
+  var flowEl = document.getElementById('flow');
+  var stEl = document.getElementById('status');
 
-  var setGauge = function(lpmInt) {
-    var v = Math.max(0, Math.min(MAX_LPM, lpmInt));
+  var setGauge = function(lpm) {
+    var v = Math.max(0, Math.min(MAX_LPM, lpm));
     var offset = arcLen * (1 - v / MAX_LPM);
     bar.setAttribute('stroke-dashoffset', offset.toFixed(1));
     
     // Update flow value with animation
-    const currentFlow = parseFloat(flowEl.textContent) || 0;
-    const diff = Math.abs(v - currentFlow);
-    const duration = Math.min(300, diff * 50); // Faster for small changes
+    var currentFlow = parseFloat(flowEl.textContent) || 0;
+    var diff = Math.abs(v - currentFlow);
+    var duration = Math.min(300, diff * 50); // Faster for small changes
     
     if (duration > 20) {
       // Animate only significant changes
@@ -525,12 +686,44 @@ const char INDEX_HTML[] PROGMEM = R"=====(
   // Initialize
   setGauge(0);
   
-  // Connect WebSocket
-  connectWebSocket();
+  // Initialize WebSocket connection when page loads
+  document.addEventListener('DOMContentLoaded', function() {
+    console.log('DOM loaded, initializing...');
+    
+    // Add manual reconnect button
+    var statusEl = document.getElementById('status');
+    var statusContainer = statusEl.parentElement;
+    
+    var reconnectBtn = document.createElement('button');
+    reconnectBtn.textContent = 'Reconnect';
+    reconnectBtn.style.marginLeft = '8px';
+    reconnectBtn.style.padding = '2px 8px';
+    reconnectBtn.style.fontSize = '12px';
+    reconnectBtn.style.border = '1px solid var(--edge)';
+    reconnectBtn.style.background = 'var(--card)';
+    reconnectBtn.style.color = 'var(--ink)';
+    reconnectBtn.style.borderRadius = '4px';
+    reconnectBtn.style.cursor = 'pointer';
+    
+    reconnectBtn.onclick = function() {
+      console.log('Manual reconnect requested');
+      reconnectAttempts = 0;
+      statusEl.textContent = 'Reconnecting...';
+      statusEl.style.color = 'var(--warn)';
+      connectWebSocket();
+    };
+    
+    statusContainer.appendChild(reconnectBtn);
+    
+    // Initial connection
+    console.log('Connecting WebSocket...');
+    connectWebSocket();
+  });
   
   // Handle page visibility changes
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && (ws === undefined || ws.readyState === WebSocket.CLOSED)) {
+  document.addEventListener('visibilitychange', function() {
+    if (!document.hidden && (!ws || ws.readyState === WebSocket.CLOSED)) {
+      console.log('Page became visible, reconnecting WebSocket...');
       connectWebSocket();
     }
   });
@@ -569,6 +762,12 @@ void setupWeb() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/metrics", HTTP_GET, handleMetrics);
   
+  // Enable CORS for all routes
+  server.onNotFound([]() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(404, "text/plain", "Not found");
+  });
+  
   // Start HTTP server
   server.begin();
   
@@ -576,6 +775,11 @@ void setupWeb() {
   webSocket.enableHeartbeat(15000, 3000, 2);
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
+  
+  // Disable debug output for production
+  #ifndef DEBUG
+  webSocket.disableHeartbeat();
+  #endif
   
   Serial.println("HTTP server started");
   Serial.println("WebSocket server started on ws://<ip>:81");
@@ -713,13 +917,17 @@ void sampleOnce() {
   
   g_hz_f = hz;
 
-  // Broadcast to all WebSocket clients
-  if (webSocket.connectedClients() > 0) {
-    StaticJsonDocument<128> doc;
+  // Broadcast to all WebSocket clients if there's a change in flow
+  static float lastSentFlow = -1;
+  if (abs(g_flow_lpm_f - lastSentFlow) > 0.01f && webSocket.connectedClients() > 0) {
+    StaticJsonDocument<192> doc;
     getMetricsJSON(doc);
     String json;
-    serializeJson(doc, json);
-    webSocket.broadcastTXT(json);
+    if (serializeJson(doc, json) > 0) {
+      // Serial.println("Broadcasting: " + json); // Uncomment for debugging
+      webSocket.broadcastTXT(json);
+      lastSentFlow = g_flow_lpm_f;
+    }
   }
 
   // Debug output - using F() macro for strings
