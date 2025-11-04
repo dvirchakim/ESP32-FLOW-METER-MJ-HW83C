@@ -17,8 +17,14 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include "driver/pcnt.h"
+#include <WebSocketsServer.h>
 #include <ESPmDNS.h>
+#include <driver/pcnt.h>
+#include <esp_wifi.h>
+#include <esp_bt.h>
+#include <esp_sleep.h>
+#include <esp_task_wdt.h>
+#include <ArduinoJson.h>
 
 // ------------ Wi-Fi ------------
 static const char* WIFI_SSID     = "NAME";
@@ -26,6 +32,25 @@ static const char* WIFI_PASSWORD = "PASS";
 static const char* AP_SSID       = "ESP32-Flow";
 static const char* AP_PASS       = "12345678";
 static const char* MDNS_NAME     = "esp32flow";
+
+// ------------ Authentication ------------
+const char* www_username = "admin";
+const char* www_password = "flowmeter";
+
+// ------------ Power Management ------------
+#define FLOW_TIMEOUT_MS 300000  // 5 minutes of no flow before entering light sleep
+#define DEEP_SLEEP_ENABLED true
+unsigned long last_flow_detected = 0;
+bool flow_active = false;
+
+// ------------ WebSocket ------------
+WebSocketsServer webSocket = WebSocketsServer(81);
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+
+// ------------ Error Handling ------------
+#define MAX_OVERFLOW_COUNT 10
+uint32_t overflow_count = 0;
+bool overflow_detected = false;
 
 // ------------ Flow input ------------
 static const gpio_num_t FLOW_GPIO = GPIO_NUM_34;
@@ -60,22 +85,28 @@ unsigned long last_sample_ms = 0;
 
 // ------------ PCNT ------------
 void pcnt_init_unit() {
-  pinMode((int)FLOW_GPIO, INPUT); // sensor gives push-pull pulses per user
+  pinMode((int)FLOW_GPIO, INPUT_PULLUP); // Enable internal pull-up for better noise immunity
 
-  pcnt_config_t cfg = {};
-  cfg.pulse_gpio_num = FLOW_GPIO;
-  cfg.ctrl_gpio_num  = PCNT_PIN_NOT_USED;
-  cfg.pos_mode       = PCNT_COUNT_INC;
-  cfg.neg_mode       = PCNT_COUNT_DIS;
-  cfg.lctrl_mode     = PCNT_MODE_KEEP;
-  cfg.hctrl_mode     = PCNT_MODE_KEEP;
-  cfg.counter_h_lim  = 32767;
-  cfg.counter_l_lim  = -32768;
-  cfg.unit           = PCNT_UNIT;
-  cfg.channel        = PCNT_CHANNEL_0;
+  pcnt_config_t cfg = {
+    .pulse_gpio_num = FLOW_GPIO,
+    .ctrl_gpio_num = PCNT_PIN_NOT_USED,
+    .lctrl_mode = PCNT_MODE_KEEP,
+    .hctrl_mode = PCNT_MODE_KEEP,
+    .pos_mode = PCNT_COUNT_INC,   // Count rising edge
+    .neg_mode = PCNT_COUNT_DIS,   // Disable counting falling edge
+    .counter_h_lim = 30000,       // Below INT16_MAX to detect potential overflow
+    .counter_l_lim = -30000,      // Above INT16_MIN to detect potential underflow
+    .unit = PCNT_UNIT_0,
+    .channel = PCNT_CHANNEL_0
+  };
 
-  pcnt_unit_config(&cfg);
+  // Initialize PCNT unit
+  if (pcnt_unit_config(&cfg) != ESP_OK) {
+    Serial.println("PCNT config failed");
+    return;
+  }
 
+  // Configure and enable glitch filter if needed
   if (PCNT_GLITCH_FILTER > 0) {
     pcnt_set_filter_value(PCNT_UNIT, PCNT_GLITCH_FILTER);
     pcnt_filter_enable(PCNT_UNIT);
@@ -83,9 +114,28 @@ void pcnt_init_unit() {
     pcnt_filter_disable(PCNT_UNIT);
   }
 
+  // Clear and start counter
   pcnt_counter_pause(PCNT_UNIT);
   pcnt_counter_clear(PCNT_UNIT);
+  
+  // Set up event on high limit (for overflow detection)
+  pcnt_event_enable(PCNT_UNIT, PCNT_EVT_H_LIM);
+  
+  // Register ISR service
+  pcnt_isr_service_install(0);
+  pcnt_isr_handler_add(PCNT_UNIT, []() {
+    overflow_detected = true;
+    overflow_count++;
+    if (overflow_count >= MAX_OVERFLOW_COUNT) {
+      // Reset counter if too many overflows
+      pcnt_counter_clear(PCNT_UNIT);
+      overflow_count = 0;
+    }
+  }, NULL);
+  
   pcnt_counter_resume(PCNT_UNIT);
+  
+  Serial.println("PCNT unit initialized");
 }
 
 // ------------ Wi-Fi ------------
@@ -113,6 +163,53 @@ void startWiFi() {
   } else {
     Serial.println("mDNS setup failed");
   }
+}
+
+// ------------ WebSocket Event Handler ------------
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.printf("[%u] Disconnected!\n", num);
+      break;
+    case WStype_CONNECTED: {
+      IPAddress ip = webSocket.remoteIP(num);
+      Serial.printf("[%u] Connected from %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
+      // Send current state on connect
+      String json = getMetricsJSON();
+      webSocket.sendTXT(num, json);
+      break;
+    }
+    case WStype_TEXT:
+      // Handle incoming WebSocket messages if needed
+      break;
+    default:
+      break;
+  }
+}
+
+// ------------ Authentication Middleware ------------
+bool is_authenticated() {
+  if (!server.authenticate(www_username, www_password)) {
+    server.requestAuthentication();
+    return false;
+  }
+  return true;
+}
+
+// ------------ Metrics JSON Generator ------------
+String getMetricsJSON() {
+  StaticJsonDocument<256> doc;
+  doc["flow_lpm_int"] = (int)lroundf(g_flow_lpm_f);
+  doc["hz_int"] = (int)lroundf(g_hz_f);
+  doc["total_liters_int"] = (int)lroundf(g_total_liters_f);
+  doc["t_ms"] = millis();
+  doc["model"] = USE_FREQ_MODEL ? "Hz_per_LPM" : "Pulses_per_Liter";
+  doc["ppl_int"] = (int)lroundf(PULSES_PER_LITER * CAL_TRIM);
+  doc["overflow"] = overflow_detected;
+  
+  String json;
+  serializeJson(doc, json);
+  return json;
 }
 
 // ------------ Web UI ------------
@@ -147,6 +244,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   .big .unit{color:var(--muted);font-size:13px}
   .kv{display:flex;justify-content:space-between;color:var(--muted);font-size:14px;margin:8px 0}
   .kv b{color:var(--ink)}
+  .status-warn{color:var(--warn) !important;}
   .foot{margin-top:10px;color:var(--muted);font-size:12px;text-align:right}
   /* Gauge */
   .gauge{width:100%;max-width:420px;filter: drop-shadow(0 6px 18px rgba(90,169,255,.15));}
@@ -202,6 +300,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
         <div class="kv"><span>Last update</span><b id="ts">—</b></div>
         <div class="kv"><span>Model</span><b id="model">Pulses_per_Liter</b></div>
         <div class="kv"><span>Calibration</span><b><span id="ppl">1319</span> PPL</b></div>
+        <div class="kv"><span>Status</span><b id="statusText">Normal</b></div>
       </div>
     </div>
 
@@ -210,11 +309,75 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 </div>
 
 <script>
+  // Configuration
   const MAX_LPM = 10; // full-scale; change if your flow goes higher
+  const WS_RECONNECT_DELAY = 2000; // ms between WebSocket reconnection attempts
+  
+  // Initialize UI
   document.getElementById('midLbl').textContent = Math.round(MAX_LPM/2);
   document.getElementById('maxLbl').textContent = MAX_LPM;
+  
+  // WebSocket connection
+  let ws;
+  let reconnectTimeout;
+  
+  function connectWebSocket() {
+    const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+    const host = window.location.host;
+    ws = new WebSocket(protocol + host + ':81');
+    
+    ws.onopen = function() {
+      console.log('WebSocket connected');
+      document.getElementById('status').textContent = 'Connected';
+      document.getElementById('status').style.color = 'var(--ok)';
+      clearTimeout(reconnectTimeout);
+    };
+    
+    ws.onmessage = function(event) {
+      const data = JSON.parse(event.data);
+      updateUI(data);
+    };
+    
+    ws.onclose = function() {
+      console.log('WebSocket disconnected');
+      document.getElementById('status').textContent = 'Reconnecting...';
+      document.getElementById('status').style.color = 'var(--warn)';
+      
+      // Try to reconnect after a delay
+      clearTimeout(reconnectTimeout);
+      reconnectTimeout = setTimeout(connectWebSocket, WS_RECONNECT_DELAY);
+    };
+    
+    ws.onerror = function(error) {
+      console.error('WebSocket error:', error);
+      ws.close(); // Will trigger onclose
+    };
+  }
+  
+  // Update UI with new data
+  function updateUI(data) {
+    // Update gauge
+    setGauge(data.flow_lpm_int);
+    
+    // Update metrics
+    document.getElementById('hz').textContent = data.hz_int;
+    document.getElementById('tot').textContent = data.total_liters_int;
+    document.getElementById('ts').textContent = new Date(data.t_ms).toLocaleTimeString();
+    document.getElementById('model').textContent = data.model;
+    document.getElementById('ppl').textContent = data.ppl_int;
+    
+    // Update status
+    const statusEl = document.getElementById('statusText');
+    if (data.overflow) {
+      statusEl.textContent = 'Overflow Detected!';
+      statusEl.className = 'status-warn';
+    } else {
+      statusEl.textContent = 'Normal';
+      statusEl.className = '';
+    }
+  }
 
-  // ticks
+  // Create gauge ticks
   const ticks = document.getElementById('ticks');
   for (let i = 0; i <= 20; i++) {
     const a = Math.PI - (Math.PI * i / 20);
@@ -228,88 +391,128 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     ticks.appendChild(line);
   }
 
+  // Gauge setup
   const arcLen = 346;
   const bar = document.getElementById('bar');
   const flowEl = document.getElementById('flow');
-  const hzEl   = document.getElementById('hz');
-  const totEl  = document.getElementById('tot');
-  const tsEl   = document.getElementById('ts');
-  const stEl   = document.getElementById('status');
+  const stEl = document.getElementById('status');
 
   function setGauge(lpmInt) {
     const v = Math.max(0, Math.min(MAX_LPM, lpmInt));
     const offset = arcLen * (1 - v / MAX_LPM);
     bar.setAttribute('stroke-dashoffset', offset.toFixed(1));
-    flowEl.textContent = v.toString();
-  }
-
-  async function poll() {
-    try {
-      const r = await fetch('/metrics', {cache:'no-store'});
-      if(!r.ok) throw new Error(r.status);
-      const j = await r.json();
-      setGauge(j.flow_lpm_int);
-      hzEl.textContent  = j.hz_int;
-      totEl.textContent = j.total_liters_int;
-      tsEl.textContent  = new Date(j.t_ms).toLocaleTimeString();
-      stEl.textContent = 'Live';
-      stEl.style.color = 'var(--ok)';
-      document.getElementById('model').textContent = j.model;
-      document.getElementById('ppl').textContent = j.ppl_int;
-    } catch(e){
-      stEl.textContent = 'Disconnected';
-      stEl.style.color = 'var(--warn)';
-    } finally {
-      setTimeout(poll, 500);
+    
+    // Update flow value with animation
+    const currentFlow = parseFloat(flowEl.textContent) || 0;
+    const diff = Math.abs(v - currentFlow);
+    const duration = Math.min(300, diff * 50); // Faster for small changes
+    
+    if (duration > 20) {
+      // Animate only significant changes
+      flowEl.style.transition = `color ${duration/1000}s ease-out`;
+      flowEl.style.color = v > currentFlow ? 'var(--glow2)' : 'var(--glow)';
+      
+      setTimeout(() => {
+        flowEl.textContent = v.toString();
+        flowEl.style.color = '';
+      }, 50);
+    } else {
+      flowEl.textContent = v.toString();
     }
   }
+  
+  // Initialize
   setGauge(0);
-  poll();
+  
+  // Connect WebSocket
+  connectWebSocket();
+  
+  // Handle page visibility changes
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && (ws === undefined || ws.readyState === WebSocket.CLOSED)) {
+      connectWebSocket();
+    }
+  });
 </script>
 </body>
 </html>
 )HTML";
 
-// JSON metrics with integers only
+// JSON metrics endpoint
 void handleMetrics() {
-#if USE_FREQ_MODEL
-  const char* model = "Hz_per_LPM";
-#else
-  const char* model = "Pulses_per_Liter";
-#endif
-
-  // Build integer views
-  int flow_lpm_int      = (int)lroundf(g_flow_lpm_f);
-  int hz_int            = (int)lroundf(g_hz_f);
-  int total_liters_int  = (int)lroundf(g_total_liters_f);
-  int ppl_int           = (int)lroundf(PULSES_PER_LITER * CAL_TRIM);
-
-  String json = "{";
-  json += "\"flow_lpm_int\":" + String(flow_lpm_int) + ",";
-  json += "\"hz_int\":" + String(hz_int) + ",";
-  json += "\"total_liters_int\":" + String(total_liters_int) + ",";
-  json += "\"t_ms\":" + String(millis()) + ",";
-  json += "\"model\":\"" + String(model) + "\",";
-  json += "\"ppl_int\":" + String(ppl_int);
-  json += "}";
-  server.send(200, "application/json", json);
+  if (!is_authenticated()) {
+    return;
+  }
+  server.send(200, "application/json", getMetricsJSON());
 }
 
 void handleRoot() {
+  if (!is_authenticated()) {
+    return;
+  }
   server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
 }
 
 void setupWeb() {
-  server.on("/", handleRoot);
-  server.on("/metrics", handleMetrics);
+  // Setup HTTP routes with authentication
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/metrics", HTTP_GET, handleMetrics);
+  
+  // Start HTTP server
   server.begin();
+  
+  // Start WebSocket server
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  
   Serial.println("HTTP server started");
+  Serial.println("WebSocket server started on ws://<ip>:81");
+}
+
+// ------------ Power Management ------------
+void enterLightSleep() {
+  if (!DEEP_SLEEP_ENABLED) return;
+  
+  Serial.println("Entering light sleep mode...");
+  
+  // Configure GPIO34 as wakeup source
+  esp_sleep_enable_ext0_wakeup(FLOW_GPIO, HIGH); // Wake up on HIGH level
+  
+  // Disable WiFi and BT to save power
+  WiFi.mode(WIFI_OFF);
+  btStop();
+  
+  // Enter light sleep mode
+  esp_light_sleep_start();
+  
+  // After wakeup
+  Serial.println("Woke up from light sleep");
+  
+  // Reinitialize WiFi and WebSocket
+  startWiFi();
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+}
+
+// ------------ Adaptive EMA Smoothing ------------
+float calculateAdaptiveAlpha(float flow_rate) {
+  // Base alpha on flow rate - faster response for higher flow rates
+  if (flow_rate > 5.0f) return 0.5f;  // High flow - faster response
+  if (flow_rate > 1.0f) return 0.35f; // Medium flow - balanced
+  return 0.2f;                        // Low flow - more smoothing
 }
 
 // ------------ Sampling ------------
 void sampleOnce() {
   int16_t count = 0;
   pcnt_get_counter_value(PCNT_UNIT, &count);
+  
+  // Check for overflow
+  if (overflow_detected) {
+    Serial.println("Warning: PCNT overflow detected!");
+    overflow_detected = false;
+  }
+  
   pcnt_counter_clear(PCNT_UNIT);
 
   const float gate_s = SAMPLE_MS / 1000.0f;
@@ -327,44 +530,115 @@ void sampleOnce() {
   flow_now_lpm = liters_inc * (60.0f / gate_s);        // instantaneous estimate
 #endif
 
-  // Exponential moving average for smoother gauge
-  g_flow_lpm_f = (FLOW_EMA_ALPHA * flow_now_lpm) + ((1.0f - FLOW_EMA_ALPHA) * g_flow_lpm_f);
-  g_total_liters_f += liters_inc;
+  // Update flow activity status
+  if (flow_now_lpm > 0.1f) {  // Threshold to consider flow active
+    last_flow_detected = millis();
+    if (!flow_active) {
+      flow_active = true;
+      Serial.println("Flow detected - System active");
+    }
+  }
+
+  // Adaptive EMA smoothing based on flow rate
+  float alpha = calculateAdaptiveAlpha(flow_now_lpm);
+  g_flow_lpm_f = (alpha * flow_now_lpm) + ((1.0f - alpha) * g_flow_lpm_f);
+  
+  // Only update total if we have valid flow
+  if (flow_now_lpm > 0.05f) {  // Small threshold to ignore noise
+    g_total_liters_f += liters_inc;
+  }
+  
   g_hz_f = hz;
 
-  // Serial Plotter integers
-  int flow_i = (int)lroundf(g_flow_lpm_f);
-  int hz_i   = (int)lroundf(g_hz_f);
-  int tot_i  = (int)lroundf(g_total_liters_f);
-  Serial.printf("flow_lpm:%d\thz:%d\ttotal_liters:%d\n", flow_i, hz_i, tot_i);
+  // Broadcast to all WebSocket clients
+  if (webSocket.connectedClients() > 0) {
+    String json = getMetricsJSON();
+    webSocket.broadcastTXT(json);
+  }
+
+  // Debug output
+  static unsigned long last_debug = 0;
+  if (millis() - last_debug > 1000) {
+    last_debug = millis();
+    int flow_i = (int)lroundf(g_flow_lpm_f);
+    int hz_i   = (int)lroundf(g_hz_f);
+    int tot_i  = (int)lroundf(g_total_liters_f);
+    Serial.printf("Flow: %d L/min | Freq: %d Hz | Total: %d L | Clients: %d\n", 
+                 flow_i, hz_i, tot_i, webSocket.connectedClients());
+  }
+  
+  // Check for inactivity timeout
+  if (DEEP_SLEEP_ENABLED && flow_active && (millis() - last_flow_detected > FLOW_TIMEOUT_MS)) {
+    flow_active = false;
+    Serial.println("No flow detected - Entering power save mode");
+    enterLightSleep();
+  }
 }
 
 // ------------ Arduino ------------
 void setup() {
+  // Initialize serial
   Serial.begin(115200);
   delay(250);
-  Serial.println();
-  Serial.println(F("ESP32 Flow Meter + Modern Integer Gauge"));
+  
+  // Print startup banner
+  Serial.println("\n================================");
+  Serial.println("  ESP32 Flow Meter Pro");
+  Serial.println("  Version: 2.0");
+  Serial.println("  Features:");
+  Serial.println("  - WebSocket Real-time Updates");
+  Serial.println("  - Adaptive EMA Smoothing");
+  Serial.println("  - Power Management");
+  Serial.println("  - Overflow Protection");
+  Serial.println("================================");
+  
+  // Print configuration
 #if USE_FREQ_MODEL
   Serial.printf("Mode: Frequency model  K=%.3f Hz/LPM\n", HZ_PER_LPM);
 #else
   Serial.printf("Mode: Pulses-per-Liter  PPL=%.1f  Trim=%.2f\n", PULSES_PER_LITER, CAL_TRIM);
 #endif
   Serial.printf("Sample window: %lu ms\n", (unsigned long)SAMPLE_MS);
-
+  Serial.printf("Power save: %s\n", DEEP_SLEEP_ENABLED ? "Enabled" : "Disabled");
+  if (DEEP_SLEEP_ENABLED) {
+    Serial.printf("  Sleep after: %d ms of inactivity\n", FLOW_TIMEOUT_MS);
+  }
+  
+  // Initialize components
   pcnt_init_unit();
   startWiFi();
   setupWeb();
-
+  
+  // Configure watchdog
+  esp_task_wdt_init(10, true); // Enable panic so ESP32 restarts on watchdog timeout
+  esp_task_wdt_add(NULL);      // Add current thread to WDT watch
+  
   last_sample_ms = millis();
+  last_flow_detected = millis();
+  
+  Serial.println("Initialization complete. System ready.");
 }
 
 void loop() {
-  server.handleClient();
-
+  static unsigned long last_wdt_feed = 0;
   unsigned long now = millis();
+  
+  // Handle web server and WebSocket clients
+  server.handleClient();
+  webSocket.loop();
+  
+  // Handle sampling
   if (now - last_sample_ms >= SAMPLE_MS) {
     last_sample_ms = now;
     sampleOnce();
   }
+  
+  // Feed the watchdog periodically
+  if (now - last_wdt_feed > 1000) {
+    esp_task_wdt_reset();
+    last_wdt_feed = now;
+  }
+  
+  // Small delay to prevent watchdog triggers
+  delay(1);
 }
