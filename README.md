@@ -135,3 +135,4 @@ Dvir Chakim - [GitHub](https://github.com/dvirchakim)
 - ESP32 Arduino Core Team
 - WebSockets Library
 - ArduinoJson Library
+- SWE-1 + WINDSURF  
