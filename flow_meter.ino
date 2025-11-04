@@ -74,8 +74,7 @@ const char* www_password = "flowmeter";
 // ------------ Power Management ------------
 #define FLOW_TIMEOUT_MS 300000  // 5 minutes of no flow before entering light sleep
 #define DEEP_SLEEP_ENABLED true
-unsigned long last_flow_detected = 0;
-bool flow_active = false;
+// Moved to shared globals section
 
 // ------------ WebSocket ------------
 WebSocketsServer webSocket(81);  // Removed unnecessary initialization
@@ -237,7 +236,7 @@ void getMetricsJSON(JsonDocument& doc) {
 }
 
 // ------------ Web UI ------------
-const char INDEX_HTML[] PROGMEM = R"HTML(
+const char INDEX_HTML[] PROGMEM = R"=====(
 <!doctype html>
 <html lang="en">
 <head>
@@ -355,9 +354,9 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   let ws;
   let reconnectTimeout;
   
-  function connectWebSocket() {
-    const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-    const host = window.location.host;
+  var connectWebSocket = function() {
+    var protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+    var host = window.location.host;
     ws = new WebSocket(protocol + host + ':81');
     
     ws.onopen = function() {
@@ -368,7 +367,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     };
     
     ws.onmessage = function(event) {
-      const data = JSON.parse(event.data);
+      var data = JSON.parse(event.data);
       updateUI(data);
     };
     
@@ -386,10 +385,10 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       console.error('WebSocket error:', error);
       ws.close(); // Will trigger onclose
     };
-  }
+  };
   
   // Update UI with new data
-  function updateUI(data) {
+  var updateUI = function(data) {
     // Update chart
     flowChart.data.datasets[0].data.push(data.flow_lpm_int);
     if (flowChart.data.datasets[0].data.length > maxDataPoints) {
@@ -499,9 +498,9 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   const flowEl = document.getElementById('flow');
   const stEl = document.getElementById('status');
 
-  function setGauge(lpmInt) {
-    const v = Math.max(0, Math.min(MAX_LPM, lpmInt));
-    const offset = arcLen * (1 - v / MAX_LPM);
+  var setGauge = function(lpmInt) {
+    var v = Math.max(0, Math.min(MAX_LPM, lpmInt));
+    var offset = arcLen * (1 - v / MAX_LPM);
     bar.setAttribute('stroke-dashoffset', offset.toFixed(1));
     
     // Update flow value with animation
@@ -538,7 +537,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 </script>
 </body>
 </html>
-)HTML";
+)=====";
 
 // JSON metrics endpoint
 void handleMetrics() {
@@ -666,6 +665,8 @@ void sensorTask(void *pvParameters) {
 
 // ------------ Sampling (Legacy, kept for reference) ------------
 void sampleOnce() {
+  // This function is kept for reference but not used in dual-core mode
+  // All sampling is now handled in the sensorTask() function
   int16_t count = 0;
   pcnt_get_counter_value(PCNT_UNIT, &count);
   
@@ -716,12 +717,9 @@ void sampleOnce() {
   if (webSocket.connectedClients() > 0) {
     StaticJsonDocument<128> doc;
     getMetricsJSON(doc);
-    size_t len = measureJson(doc);
-    AsyncWebSocketMessageBuffer *buffer = webSocket.makeBuffer(len);
-    if (buffer) {
-      serializeJson(doc, (char *)buffer->get(), len + 1);
-      webSocket.broadcastTXT(buffer);
-    }
+    String json;
+    serializeJson(doc, json);
+    webSocket.broadcastTXT(json);
   }
 
   // Debug output - using F() macro for strings
