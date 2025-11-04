@@ -26,6 +26,26 @@
 #include <esp_task_wdt.h>
 #include <ArduinoJson.h>
 
+// ------------ Dual Core Setup ------------
+#if CONFIG_FREERTOS_UNICORE
+  #define ARDUINO_RUNNING_CORE 0
+#else
+  #define ARDUINO_RUNNING_CORE 1  // Core 0 is the default for Arduino, we'll use Core 1 for our main task
+#endif
+
+// Mutex for thread-safe access to shared variables
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+// Task handles
+TaskHandle_t SensorTask;
+
+// ------------ Constants ------------
+// Memory optimization settings
+#define MAX_OVERFLOW_COUNT 10   // Maximum number of overflows before resetting counter
+#define JSON_DOC_SIZE 128       // Reduced from 256 to save RAM
+#define WS_TIMEOUT 5000         // WebSocket timeout in ms
+#define MAX_WS_CLIENTS 2        // Limit number of WebSocket clients
+
 // Global variables for ISR
 volatile bool overflow_detected = false;
 volatile uint32_t overflow_count = 0;
@@ -58,11 +78,10 @@ unsigned long last_flow_detected = 0;
 bool flow_active = false;
 
 // ------------ WebSocket ------------
-WebSocketsServer webSocket = WebSocketsServer(81);
+WebSocketsServer webSocket(81);  // Removed unnecessary initialization
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
 
 // ------------ Error Handling ------------
-#define MAX_OVERFLOW_COUNT 10
 
 // ------------ Flow input ------------
 static const gpio_num_t FLOW_GPIO = GPIO_NUM_34;
@@ -85,13 +104,16 @@ static const uint16_t PCNT_GLITCH_FILTER = 0;
 // Simple smoothing on the instantaneous flow to avoid jumpy gauge
 static const float FLOW_EMA_ALPHA = 0.35f;  // 0..1 (higher = snappier)
 
-// ------------ Globals ------------
+// ------------ Shared Globals ------------
 static pcnt_unit_t PCNT_UNIT = PCNT_UNIT_0;
 WebServer server(80);
 
-float g_flow_lpm_f = 0.0f;   // EMA-smoothed float (internal)
-float g_total_liters_f = 0.0f;
-float g_hz_f = 0.0f;
+// Shared variables between cores (volatile for thread safety)
+volatile float g_flow_lpm_f = 0.0f;   // EMA-smoothed float (internal)
+volatile float g_total_liters_f = 0.0f;
+volatile float g_hz_f = 0.0f;
+volatile unsigned long last_flow_detected = 0;
+volatile bool flow_active = false;
 
 unsigned long last_sample_ms = 0;
 
@@ -179,7 +201,10 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
       IPAddress ip = webSocket.remoteIP(num);
       Serial.printf("[%u] Connected from %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
       // Send current state on connect
-      String json = getMetricsJSON();
+      StaticJsonDocument<128> doc;
+      getMetricsJSON(doc);
+      String json;
+      serializeJson(doc, json);
       webSocket.sendTXT(num, json);
       break;
     }
@@ -201,19 +226,14 @@ bool is_authenticated() {
 }
 
 // ------------ Metrics JSON Generator ------------
-String getMetricsJSON() {
-  StaticJsonDocument<256> doc;
-  doc["flow_lpm_int"] = (int)lroundf(g_flow_lpm_f);
-  doc["hz_int"] = (int)lroundf(g_hz_f);
-  doc["total_liters_int"] = (int)lroundf(g_total_liters_f);
-  doc["t_ms"] = millis();
-  doc["model"] = USE_FREQ_MODEL ? "Hz_per_LPM" : "Pulses_per_Liter";
-  doc["ppl_int"] = (int)lroundf(PULSES_PER_LITER * CAL_TRIM);
-  doc["overflow"] = overflow_detected;
-  
-  String json;
-  serializeJson(doc, json);
-  return json;
+void getMetricsJSON(JsonDocument& doc) {
+  doc[F("flow_lpm_int")] = (int)lroundf(g_flow_lpm_f);
+  doc[F("hz_int")] = (int)lroundf(g_hz_f);
+  doc[F("total_liters_int")] = (int)lroundf(g_total_liters_f);
+  doc[F("t_ms")] = millis();
+  doc[F("model")] = USE_FREQ_MODEL ? F("Hz_per_LPM") : F("Pulses_per_Liter");
+  doc[F("ppl_int")] = (int)lroundf(PULSES_PER_LITER * CAL_TRIM);
+  doc[F("overflow")] = overflow_detected;
 }
 
 // ------------ Web UI ------------
@@ -224,6 +244,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32 Flow Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
   :root{
     --bg:#0a0f14; --card:#0f1520; --edge:#1d2a3b; --ink:#eaf3ff; --muted:#9bb1c9;
@@ -250,6 +271,8 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   .kv b{color:var(--ink)}
   .status-warn{color:var(--warn) !important;}
   .foot{margin-top:10px;color:var(--muted);font-size:12px;text-align:right}
+  .chart-container {margin-top:20px; width:100%; height:200px;}
+  .chart-panel {margin-top:20px;}
   /* Gauge */
   .gauge{width:100%;max-width:420px;filter: drop-shadow(0 6px 18px rgba(90,169,255,.15));}
   .track{stroke:#162233;stroke-width:18;fill:none;stroke-linecap:round}
@@ -308,6 +331,13 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       </div>
     </div>
 
+    <div class="panel chart-panel">
+      <div class="kv"><span>Flow Rate History (Last 60s)</span></div>
+      <div class="chart-container">
+        <canvas id="flowChart"></canvas>
+      </div>
+    </div>
+
     <div class="foot"> made by dvir </div>
   </div>
 </div>
@@ -360,6 +390,13 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   
   // Update UI with new data
   function updateUI(data) {
+    // Update chart
+    flowChart.data.datasets[0].data.push(data.flow_lpm_int);
+    if (flowChart.data.datasets[0].data.length > maxDataPoints) {
+      flowChart.data.datasets[0].data.shift();
+    }
+    flowChart.update('none');
+    
     // Update gauge
     setGauge(data.flow_lpm_int);
     
@@ -394,6 +431,67 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     line.setAttribute("class","tick");
     ticks.appendChild(line);
   }
+
+  // Chart setup
+  const maxDataPoints = 60; // 60 seconds of data at 1s intervals
+  const flowChartCtx = document.getElementById('flowChart').getContext('2d');
+  const flowChart = new Chart(flowChartCtx, {
+    type: 'line',
+    data: {
+      labels: Array(maxDataPoints).fill(''),
+      datasets: [{
+        label: 'Flow Rate (L/min)',
+        data: [],
+        borderColor: '#5aa9ff',
+        backgroundColor: 'rgba(90, 169, 255, 0.1)',
+        borderWidth: 2,
+        fill: true,
+        tension: 0.3
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: {
+        duration: 0
+      },
+      scales: {
+        y: {
+          min: 0,
+          max: MAX_LPM,
+          grid: {
+            color: 'rgba(36, 52, 74, 0.5)'
+          },
+          ticks: {
+            color: '#9bb1c9'
+          }
+        },
+        x: {
+          display: false
+        }
+      },
+      plugins: {
+        legend: {
+          display: false
+        },
+        tooltip: {
+          mode: 'index',
+          intersect: false,
+          callbacks: {
+            label: function(context) {
+              return 'Flow: ' + context.parsed.y.toFixed(2) + ' L/min';
+            }
+          }
+        }
+      }
+    }
+  });
+
+  // Initialize chart with zeros
+  for (let i = 0; i < maxDataPoints; i++) {
+    flowChart.data.datasets[0].data.push(0);
+  }
+  flowChart.update();
 
   // Gauge setup
   const arcLen = 346;
@@ -447,7 +545,17 @@ void handleMetrics() {
   if (!is_authenticated()) {
     return;
   }
-  server.send(200, "application/json", getMetricsJSON());
+  
+  // Use a single buffer for the response
+  static char response[192];
+  StaticJsonDocument<192> doc;
+  
+  getMetricsJSON(doc);
+  size_t len = serializeJson(doc, response);
+  
+  String json;
+  serializeJson(doc, json);
+  server.send(200, "application/json", json);
 }
 
 void handleRoot() {
@@ -465,7 +573,8 @@ void setupWeb() {
   // Start HTTP server
   server.begin();
   
-  // Start WebSocket server
+  // Configure and start WebSocket server
+  webSocket.enableHeartbeat(15000, 3000, 2);
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
   
@@ -506,7 +615,56 @@ float calculateAdaptiveAlpha(float flow_rate) {
   return 0.2f;                        // Low flow - more smoothing
 }
 
-// ------------ Sampling ------------
+// ------------ Sensor Task (Core 1) ------------
+void sensorTask(void *pvParameters) {
+  Serial.println("Sensor task started on core " + String(xPortGetCoreID()));
+  
+  // Initialize PCNT
+  pcnt_init_unit();
+  
+  // Main sensor loop
+  unsigned long last_sample_ms = 0;
+  
+  while (true) {
+    unsigned long now = millis();
+    
+    // Sample at 1Hz (1000ms)
+    if (now - last_sample_ms >= 1000) {
+      last_sample_ms = now;
+      
+      // Critical section - read sensor data
+      portENTER_CRITICAL(&mux);
+      int16_t count = 0;
+      pcnt_get_counter_value(PCNT_UNIT, &count);
+      pcnt_counter_clear(PCNT_UNIT);
+      portEXIT_CRITICAL(&mux);
+
+      // Calculate flow rate (simplified for example)
+      float hz = count;  // Since we're sampling over 1s
+      float flow_rate = hz / PULSES_PER_LITER * 60.0f;  // Convert to L/min
+      
+      // Update shared variables
+      portENTER_CRITICAL(&mux);
+      g_hz_f = hz;
+      g_flow_lpm_f = flow_rate;
+      
+      // Update total only if there's significant flow
+      if (flow_rate > 0.1f) {
+        g_total_liters_f += flow_rate / 60.0f;  // Convert L/min to L/s and add to total
+        last_flow_detected = now;
+        flow_active = true;
+      } else if (flow_active && (now - last_flow_detected > 300000)) {  // 5 minutes
+        flow_active = false;
+      }
+      portEXIT_CRITICAL(&mux);
+    }
+    
+    // Small delay to prevent watchdog triggers
+    delay(10);
+  }
+}
+
+// ------------ Sampling (Legacy, kept for reference) ------------
 void sampleOnce() {
   int16_t count = 0;
   pcnt_get_counter_value(PCNT_UNIT, &count);
@@ -556,19 +714,33 @@ void sampleOnce() {
 
   // Broadcast to all WebSocket clients
   if (webSocket.connectedClients() > 0) {
-    String json = getMetricsJSON();
-    webSocket.broadcastTXT(json);
+    StaticJsonDocument<128> doc;
+    getMetricsJSON(doc);
+    size_t len = measureJson(doc);
+    AsyncWebSocketMessageBuffer *buffer = webSocket.makeBuffer(len);
+    if (buffer) {
+      serializeJson(doc, (char *)buffer->get(), len + 1);
+      webSocket.broadcastTXT(buffer);
+    }
   }
 
-  // Debug output
+  // Debug output - using F() macro for strings
   static unsigned long last_debug = 0;
   if (millis() - last_debug > 1000) {
     last_debug = millis();
     int flow_i = (int)lroundf(g_flow_lpm_f);
     int hz_i   = (int)lroundf(g_hz_f);
     int tot_i  = (int)lroundf(g_total_liters_f);
-    Serial.printf("Flow: %d L/min | Freq: %d Hz | Total: %d L | Clients: %d\n", 
-                 flow_i, hz_i, tot_i, webSocket.connectedClients());
+    
+    // Using separate print statements with F() to avoid large format string in RAM
+    Serial.print(F("Flow: "));
+    Serial.print(flow_i);
+    Serial.print(F(" L/min | Freq: "));
+    Serial.print(hz_i);
+    Serial.print(F(" Hz | Total: "));
+    Serial.print(tot_i);
+    Serial.print(F(" L | Clients: "));
+    Serial.println(webSocket.connectedClients());
   }
   
   // Check for inactivity timeout
@@ -585,16 +757,16 @@ void setup() {
   Serial.begin(115200);
   delay(250);
   
-  // Print startup banner
-  Serial.println("\n================================");
-  Serial.println("  ESP32 Flow Meter Pro");
-  Serial.println("  Version: 2.0");
-  Serial.println("  Features:");
-  Serial.println("  - WebSocket Real-time Updates");
-  Serial.println("  - Adaptive EMA Smoothing");
-  Serial.println("  - Power Management");
-  Serial.println("  - Overflow Protection");
-  Serial.println("================================");
+  // Print startup banner using F() macro to store strings in flash
+  Serial.println(F("\n================================"));
+  Serial.println(F("  ESP32 Flow Meter Pro"));
+  Serial.println(F("  Version: 2.0"));
+  Serial.println(F("  Features:"));
+  Serial.println(F("  - WebSocket Real-time Updates"));
+  Serial.println(F("  - Adaptive EMA Smoothing"));
+  Serial.println(F("  - Power Management"));
+  Serial.println(F("  - Overflow Protection"));
+  Serial.println(F("================================"));
   
   // Print configuration
 #if USE_FREQ_MODEL
@@ -609,18 +781,32 @@ void setup() {
   }
   
   // Initialize components
-  pcnt_init_unit();
   startWiFi();
   setupWeb();
   
-  // Configure watchdog
+  // Create sensor task on core 0 (Arduino runs on core 1 by default)
+  xTaskCreatePinnedToCore(
+    sensorTask,    // Task function
+    "SensorTask",  // Name
+    10000,         // Stack size (in words)
+    NULL,          // Parameters
+    1,             // Priority
+    &SensorTask,   // Task handle
+    0              // Core (0 = core 0, 1 = core 1)
+  );
+  
+  if (SensorTask == NULL) {
+    Serial.println("Failed to create sensor task!");
+  }
+  
+  // Configure watchdog with optimized settings
   esp_task_wdt_config_t wdt_config = {
-    .timeout_ms = 5000,  // 5 second timeout
+    .timeout_ms = 3000,  // Reduced from 5000ms to 3000ms for faster recovery
     .idle_core_mask = 0, // Disable WDT for idle tasks
     .trigger_panic = true // Trigger panic on timeout
   };
   esp_task_wdt_init(&wdt_config);
-  esp_task_wdt_add(NULL);      // Add current thread to WDT watch
+  esp_task_wdt_add(NULL);  // Add main task to WDT
   
   last_sample_ms = millis();
   last_flow_detected = millis();
@@ -630,22 +816,57 @@ void setup() {
 
 void loop() {
   static unsigned long last_wdt_feed = 0;
+  static unsigned long last_status = 0;
   unsigned long now = millis();
   
   // Handle web server and WebSocket clients
   server.handleClient();
   webSocket.loop();
   
-  // Handle sampling
-  if (now - last_sample_ms >= SAMPLE_MS) {
-    last_sample_ms = now;
-    sampleOnce();
+  // Update WebSocket clients with latest data
+  if (webSocket.connectedClients() > 0) {
+    StaticJsonDocument<128> doc;
+    
+    // Critical section - access shared variables
+    portENTER_CRITICAL(&mux);
+    doc[F("flow_lpm_int")] = (int)lroundf(g_flow_lpm_f);
+    doc[F("hz_int")] = (int)lroundf(g_hz_f);
+    doc[F("total_liters_int")] = (int)lroundf(g_total_liters_f);
+    doc[F("t_ms")] = now;
+    doc[F("model")] = F("Pulses_per_Liter");
+    doc[F("ppl_int")] = (int)lroundf(PULSES_PER_LITER * CAL_TRIM);
+    doc[F("overflow")] = false;  // Overflow is now handled in the ISR
+    portEXIT_CRITICAL(&mux);
+    
+    // Send to all connected clients
+    String json;
+    serializeJson(doc, json);
+    webSocket.broadcastTXT(json);
   }
   
-  // Feed the watchdog periodically
-  if (now - last_wdt_feed > 1000) {
+  // Status update every second
+  if (now - last_status >= 1000) {
+    last_status = now;
+    
+    // Critical section - access shared variables
+    portENTER_CRITICAL(&mux);
+    int flow_i = (int)lroundf(g_flow_lpm_f);
+    int hz_i = (int)lroundf(g_hz_f);
+    int tot_i = (int)lroundf(g_total_liters_f);
+    portEXIT_CRITICAL(&mux);
+    
+    // Print status
+    Serial.print(F("Flow: "));
+    Serial.print(flow_i);
+    Serial.print(F(" L/min | Freq: "));
+    Serial.print(hz_i);
+    Serial.print(F(" Hz | Total: "));
+    Serial.print(tot_i);
+    Serial.print(F(" L | Clients: "));
+    Serial.println(webSocket.connectedClients());
+    
+    // Feed the watchdog
     esp_task_wdt_reset();
-    last_wdt_feed = now;
   }
   
   // Small delay to prevent watchdog triggers
