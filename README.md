@@ -1,6 +1,6 @@
 # ESP32 Flow Meter with Web Interface
 
-A high-precision flow meter implementation using ESP32 with a modern web interface. This project uses the MJ-HW83C flow sensor and provides real-time monitoring through a responsive web interface.
+A high-precision flow meter implementation using ESP32 with a modern web interface. This project uses the MJ-HW83C flow sensor and provides real-time monitoring through a responsive web interface. The system leverages the ESP32's dual-core architecture for optimal performance and reliability.
 
 ## Features
 
@@ -8,12 +8,14 @@ A high-precision flow meter implementation using ESP32 with a modern web interfa
   - Pulse-counting with hardware PCNT
   - Configurable pulses per liter (1319 PPL by default)
   - ±5% calibration trim
+  - Dual-core processing for reliable operation
 
 - 🌐 **Web Interface**
-  - Real-time flow rate visualization
+  - Real-time flow rate visualization with Chart.js
+  - Interactive gauge display
   - Total volume tracking
   - Responsive design for desktop and mobile
-  - WebSocket for live updates
+  - WebSocket for live updates with auto-reconnect
 
 - ⚡ **Power Management**
   - Light sleep mode during inactivity
@@ -90,6 +92,9 @@ A high-precision flow meter implementation using ESP32 with a modern web interfa
 ### Flow Sensor
 - `PULSES_PER_LITER`: 1319.0f (default)
 - `CAL_TRIM`: 1.00f (1.00 = no trim, 0.95 = -5%, 1.05 = +5%)
+- `MAX_OVERFLOW_COUNT`: 10 (maximum PCNT overflows before reset)
+- `WS_TIMEOUT`: 5000ms (WebSocket timeout)
+- `MAX_WS_CLIENTS`: 2 (maximum WebSocket connections)
 
 ### Power Management
 - `DEEP_SLEEP_ENABLED`: true/false
@@ -105,12 +110,22 @@ A high-precision flow meter implementation using ESP32 with a modern web interfa
 - `www_username`: "admin" (web interface username)
 - `www_password`: "flowmeter" (web interface password)
 
+## Recent Updates
+
+- **Dual-Core Processing**: Sensor handling and web server now run on separate cores for improved reliability
+- **Memory Optimization**: Reduced memory usage with efficient string handling and buffer management
+- **Improved Stability**: Better error handling and recovery mechanisms
+- **Enhanced UI**: Smoother gauge animations and chart updates
+- **Fixed**: WebSocket connection stability issues
+- **Fixed**: Compilation errors related to JavaScript function declarations
+
 ## Troubleshooting
 
 ### No Flow Reading
-- Check wiring connections
+- Check wiring connections (GPIO34 for flow sensor)
 - Verify sensor is receiving power (LED should blink with flow)
 - Check Serial Monitor for error messages
+- Ensure no PCNT overflow errors in the logs
 
 ### Can't Connect to Web Interface
 - Verify WiFi connection
@@ -125,6 +140,19 @@ A high-precision flow meter implementation using ESP32 with a modern web interfa
 ## License
 
 This project is open source and available under the [MIT License](LICENSE).
+
+## Development Notes
+
+### Code Structure
+- `sensorTask()`: Runs on Core 0, handles all sensor readings and flow calculations
+- `loop()`: Runs on Core 1, manages web server and WebSocket connections
+- `webSocketEvent()`: Handles WebSocket communication with the web interface
+- `pcnt_isr_handler()`: Interrupt service routine for pulse counting
+
+### Memory Management
+- Uses PROGMEM for storing HTML/JavaScript content
+- Optimized JSON document sizes to reduce memory usage
+- Efficient string handling with F() macro for constant strings
 
 ## Author
 
