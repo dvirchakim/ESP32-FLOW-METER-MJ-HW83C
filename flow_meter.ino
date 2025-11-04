@@ -104,7 +104,7 @@ static const float CAL_TRIM = 1.00f;
 static const float HZ_PER_LPM = 7.5f;
 
 // Sampling
-static const uint32_t SAMPLE_MS = 1000;    // 1 Hz updates
+static const uint32_t SAMPLE_MS = 250;     // 4 Hz updates
 
 // PCNT glitch filter (0 disables). ~1000 ≈ 12.5 µs at 80 MHz APB.
 static const uint16_t PCNT_GLITCH_FILTER = 0;
@@ -500,11 +500,32 @@ const char INDEX_HTML[] PROGMEM = R"=====(
       
       ws.onmessage = function(event) {
         try {
-          console.log('WebSocket message received:', event.data);
-          var data = JSON.parse(event.data);
-          updateUI(data);
+          var data;
+          try {
+            // Try to parse as JSON
+            data = JSON.parse(event.data);
+            
+            // Handle case where we might have received a stringified JSON string
+            if (typeof data === 'string') {
+              data = JSON.parse(data);
+            }
+            
+            // Debug log the raw message and parsed data
+            console.log('WebSocket message received:', event.data);
+            console.log('Parsed data:', data);
+            
+            // Make sure we have valid data before updating UI
+            if (data && (data.flow_lpm !== undefined || data.flow_lpm_int !== undefined)) {
+              updateUI(data);
+            } else {
+              console.warn('Received data in unexpected format:', data);
+            }
+          } catch (parseError) {
+            console.error('Error parsing WebSocket message:', parseError);
+            console.error('Raw message:', event.data);
+          }
         } catch (e) {
-          console.error('Error processing WebSocket message:', e);
+          console.error('Error in WebSocket message handler:', e);
         }
       };
       
@@ -543,15 +564,32 @@ const char INDEX_HTML[] PROGMEM = R"=====(
       messageCount++;
       lastMessageTime = Date.now();
       
-      // Debug log every 10th message
-      if (messageCount % 10 === 0) {
-        console.log('Message #' + messageCount, data);
+      // Debug log every message
+      console.log('Updating UI with data:', data);
+      
+      // Handle both float and integer formats
+      var flowValue = 0;
+      var hzValue = 0;
+      var totalValue = 0;
+      
+      // Check for both float and int versions of each value
+      if (data.flow_lpm !== undefined) {
+        flowValue = parseFloat(data.flow_lpm);
+      } else if (data.flow_lpm_int !== undefined) {
+        flowValue = parseFloat(data.flow_lpm_int) / 1000.0;
       }
       
-      // Convert integer values to float for display
-      var flowValue = data.flow_lpm_int / 1000.0;  // Assuming values are multiplied by 1000 on the ESP32
-      var hzValue = data.hz_int / 1000.0;
-      var totalValue = data.total_liters_int / 1000.0;
+      if (data.hz !== undefined) {
+        hzValue = parseFloat(data.hz);
+      } else if (data.hz_int !== undefined) {
+        hzValue = parseFloat(data.hz_int) / 1000.0;
+      }
+      
+      if (data.total_liters !== undefined) {
+        totalValue = parseFloat(data.total_liters);
+      } else if (data.total_liters_int !== undefined) {
+        totalValue = parseFloat(data.total_liters_int) / 1000.0;
+      }
       
       // Update flow value display
       var flowEl = document.getElementById('flow');
@@ -592,7 +630,7 @@ const char INDEX_HTML[] PROGMEM = R"=====(
       if (totEl) totEl.textContent = totalValue.toFixed(3);
       if (tsEl) tsEl.textContent = new Date(data.t_ms).toLocaleTimeString();
       if (modelEl) modelEl.textContent = data.model || 'N/A';
-      if (pplEl) pplEl.textContent = data.ppl_int || 'N/A';
+      if (pplEl) pplEl.textContent = (data.ppl || data.ppl_int || 'N/A').toString();
       
       // Update status
       var statusEl = document.getElementById('statusText');
@@ -886,8 +924,8 @@ void sensorTask(void *pvParameters) {
   while (true) {
     unsigned long now = millis();
     
-    // Sample at 1Hz (1000ms)
-    if (now - last_sample_ms >= 1000) {
+    // Sample at configured interval
+    if (now - last_sample_ms >= SAMPLE_MS) {
       last_sample_ms = now;
       
       // Critical section - read sensor data
@@ -897,9 +935,11 @@ void sensorTask(void *pvParameters) {
       pcnt_counter_clear(PCNT_UNIT);
       portEXIT_CRITICAL(&mux);
 
-      // Calculate flow rate (simplified for example)
-      float hz = count;  // Since we're sampling over 1s
-      float flow_rate = hz / PULSES_PER_LITER * 60.0f;  // Convert to L/min
+      // Calculate timing and flow metrics
+      const float gate_s = SAMPLE_MS / 1000.0f;
+      float hz = (gate_s > 0.0f) ? (count / gate_s) : 0.0f;  // Pulses per second
+      float flow_rate = (hz / PULSES_PER_LITER) * 60.0f;     // L/min
+      float liters_inc = flow_rate * (gate_s / 60.0f);       // L added this window
       
       // Update shared variables
       portENTER_CRITICAL(&mux);
@@ -908,20 +948,74 @@ void sensorTask(void *pvParameters) {
       
       // Update total only if there's significant flow
       if (flow_rate > 0.1f) {
-        g_total_liters_f += flow_rate / 60.0f;  // Convert L/min to L/s and add to total
+        g_total_liters_f += liters_inc;
         last_flow_detected = now;
         flow_active = true;
       } else if (flow_active && (now - last_flow_detected > 300000)) {  // 5 minutes
         flow_active = false;
       }
       portEXIT_CRITICAL(&mux);
+
+      // Broadcast to WebSocket clients when values change
+      static unsigned long lastBroadcast = 0;
+      static float lastSentFlow = -1.0f;
+      static unsigned long lastDebugOutput = 0;
+
+      bool hasClients = webSocket.connectedClients() > 0;
+      bool elapsed = (millis() - lastBroadcast) >= SAMPLE_MS;
+      bool changed = fabsf(g_flow_lpm_f - lastSentFlow) > 0.01f;
+
+      if (millis() - lastDebugOutput > 2000) {
+        lastDebugOutput = millis();
+        Serial.print("Flow: ");
+        Serial.print(g_flow_lpm_f, 3);
+        Serial.print(" L/min, Hz: ");
+        Serial.print(g_hz_f, 1);
+        Serial.print(", Total: ");
+        Serial.print(g_total_liters_f, 3);
+        Serial.print(" L, RSSI: ");
+        Serial.print(WiFi.RSSI());
+        Serial.print(" dBm, Clients: ");
+        Serial.println(webSocket.connectedClients());
+      }
+
+      if (hasClients && (elapsed || changed)) {
+        StaticJsonDocument<256> doc;
+        doc["flow_lpm"] = g_flow_lpm_f;
+        doc["flow_lpm_int"] = (int)(g_flow_lpm_f * 1000.0f);
+        doc["hz"] = g_hz_f;
+        doc["hz_int"] = (int)(g_hz_f * 1000.0f);
+        doc["total_liters"] = g_total_liters_f;
+        doc["total_liters_int"] = (int)(g_total_liters_f * 1000.0f);
+        doc["t_ms"] = millis();
+        doc["overflow"] = overflow_detected;
+        doc["rssi"] = WiFi.RSSI();
+        doc["clients"] = webSocket.connectedClients();
+        doc["free_heap"] = ESP.getFreeHeap();
+        doc["model"] = "Pulses_per_Liter";
+        doc["ppl"] = PULSES_PER_LITER;
+        doc["ppl_int"] = (int)PULSES_PER_LITER;
+
+        String json;
+        if (serializeJson(doc, json) > 0) {
+          if (webSocket.broadcastTXT(json)) {
+            lastSentFlow = g_flow_lpm_f;
+            lastBroadcast = millis();
+          } else {
+            Serial.println("Error: WebSocket broadcast failed");
+          }
+        } else {
+          Serial.println("Error: Failed to serialize JSON");
+        }
+      }
     }
-    
+
     // Small delay to prevent watchdog triggers
     delay(10);
   }
 }
 
+// ... (rest of the code remains the same)
 // ------------ Sampling (Legacy, kept for reference) ------------
 void sampleOnce() {
   // This function is kept for reference but not used in dual-core mode
@@ -975,6 +1069,7 @@ void sampleOnce() {
   // Broadcast to all WebSocket clients if there's a change in flow
   static unsigned long lastBroadcast = 0;
   static float lastSentFlow = -1;
+  static unsigned long lastDebugOutput = 0;
   
   // Always broadcast at least every 500ms if there are clients
   bool shouldBroadcast = (millis() - lastBroadcast >= 500 && webSocket.connectedClients() > 0);
@@ -984,18 +1079,39 @@ void sampleOnce() {
     shouldBroadcast = true;
   }
   
+  // Debug output to serial every 2 seconds
+  if (millis() - lastDebugOutput > 2000) {
+    Serial.print("Flow: ");
+    Serial.print(g_flow_lpm_f, 3);
+    Serial.print(" L/min, Hz: ");
+    Serial.print(g_hz_f, 1);
+    Serial.print(", Total: ");
+    Serial.print(g_total_liters_f, 3);
+    Serial.print(" L, RSSI: ");
+    Serial.print(WiFi.RSSI());
+    Serial.print(" dBm, Clients: ");
+    Serial.println(webSocket.connectedClients());
+    lastDebugOutput = millis();
+  }
+  
   if (shouldBroadcast && webSocket.connectedClients() > 0) {
     StaticJsonDocument<256> doc;  // Increased size for additional fields
     
-    // Add debug info
+    // Include both old and new field names for compatibility
     doc["flow_lpm"] = g_flow_lpm_f;
+    doc["flow_lpm_int"] = (int)(g_flow_lpm_f * 1000.0f);  // For backward compatibility
     doc["hz"] = g_hz_f;
+    doc["hz_int"] = (int)(g_hz_f * 1000.0f);  // For backward compatibility
     doc["total_liters"] = g_total_liters_f;
+    doc["total_liters_int"] = (int)(g_total_liters_f * 1000.0f);  // For backward compatibility
     doc["t_ms"] = millis();
     doc["overflow"] = overflow_detected;
     doc["rssi"] = WiFi.RSSI();
     doc["clients"] = webSocket.connectedClients();
     doc["free_heap"] = ESP.getFreeHeap();
+    doc["model"] = "Pulses_per_Liter";
+    doc["ppl"] = PULSES_PER_LITER;
+    doc["ppl_int"] = (int)PULSES_PER_LITER;  // For backward compatibility
     
     String json;
     if (serializeJson(doc, json) > 0) {
@@ -1008,12 +1124,11 @@ void sampleOnce() {
         if (millis() - lastDebug > 2000) {
           lastDebug = millis();
           Serial.print("WS Broadcast - Flow: ");
-          Serial.print(g_flow_lpm_f);
-          Serial.print(" L/min, Clients: ");
+          Serial.print(g_flow_lpm_f, 3);
+          Serial.print(" L/min, Hz: ");
+          Serial.print(g_hz_f, 1);
+          Serial.print(", Clients: ");
           Serial.println(webSocket.connectedClients());
-          Serial.print("JSON: ");
-          serializeJsonPretty(doc, Serial);
-          Serial.println();
         }
       } else {
         Serial.println("Error: WebSocket broadcast failed");
@@ -1023,24 +1138,8 @@ void sampleOnce() {
     }
   }
 
-  // Debug output - using F() macro for strings
-  static unsigned long last_debug = 0;
-  if (millis() - last_debug > 1000) {
-    last_debug = millis();
-    int flow_i = (int)lroundf(g_flow_lpm_f);
-    int hz_i   = (int)lroundf(g_hz_f);
-    int tot_i  = (int)lroundf(g_total_liters_f);
-    
-    // Using separate print statements with F() to avoid large format string in RAM
-    Serial.print(F("Flow: "));
-    Serial.print(flow_i);
-    Serial.print(F(" L/min | Freq: "));
-    Serial.print(hz_i);
-    Serial.print(F(" Hz | Total: "));
-    Serial.print(tot_i);
-    Serial.print(F(" L | Clients: "));
-    Serial.println(webSocket.connectedClients());
-  }
+  // Debug output is now handled in the WebSocket broadcast section
+  // to ensure consistency between serial and WebSocket output
   
   // Check for inactivity timeout
   if (DEEP_SLEEP_ENABLED && flow_active && (millis() - last_flow_detected > FLOW_TIMEOUT_MS)) {
@@ -1121,27 +1220,6 @@ void loop() {
   // Handle web server and WebSocket clients
   server.handleClient();
   webSocket.loop();
-  
-  // Update WebSocket clients with latest data
-  if (webSocket.connectedClients() > 0) {
-    StaticJsonDocument<128> doc;
-    
-    // Critical section - access shared variables
-    portENTER_CRITICAL(&mux);
-    doc[F("flow_lpm_int")] = (int)lroundf(g_flow_lpm_f);
-    doc[F("hz_int")] = (int)lroundf(g_hz_f);
-    doc[F("total_liters_int")] = (int)lroundf(g_total_liters_f);
-    doc[F("t_ms")] = now;
-    doc[F("model")] = F("Pulses_per_Liter");
-    doc[F("ppl_int")] = (int)lroundf(PULSES_PER_LITER * CAL_TRIM);
-    doc[F("overflow")] = false;  // Overflow is now handled in the ISR
-    portEXIT_CRITICAL(&mux);
-    
-    // Send to all connected clients
-    String json;
-    serializeJson(doc, json);
-    webSocket.broadcastTXT(json);
-  }
   
   // Status update every second
   if (now - last_status >= 1000) {
